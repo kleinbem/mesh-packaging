@@ -838,7 +838,7 @@ jobs:
           node --experimental-strip-types scripts/release-handoff.ts create \
             --output release-upload --matrix package-matrix.json \
             --inventory artifact-inventory.json --manifest release-handoff.json \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --repository "Mesh-LLM/mesh-packaging" --run-id "$GITHUB_RUN_ID" \
             --version "${{ needs.plan.outputs.mesh_version }}" \
             --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
             --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA"
@@ -884,7 +884,7 @@ jobs:
           cmp expected-package-matrix.json assembled/package-matrix.json
           artifact_ids="$(node --experimental-strip-types scripts/release-handoff.ts prepare \
             --manifest assembled/release-handoff.json --matrix assembled/package-matrix.json \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --repository "Mesh-LLM/mesh-packaging" --run-id "$GITHUB_RUN_ID" \
             --version "${{ needs.plan.outputs.mesh_version }}" \
             --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
             --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA")"
@@ -901,7 +901,7 @@ jobs:
             --manifest assembled/release-handoff.json --matrix assembled/package-matrix.json \
             --input release-inputs --output assembled/release-upload \
             --metadata assembled/release-metadata \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --repository "Mesh-LLM/mesh-packaging" --run-id "$GITHUB_RUN_ID" \
             --version "${{ needs.plan.outputs.mesh_version }}" \
             --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
             --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA"
