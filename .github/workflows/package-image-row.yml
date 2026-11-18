@@ -31,7 +31,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # The MeshLLM Depot project owns the persistent remote BuildKit cache.
-  DEPOT_PROJECT_ID: mzm95zcv7p
+  DEPOT_PROJECT_ID: vrds41hbbt
 
 jobs:
   package:
