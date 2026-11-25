@@ -1,0 +1,399 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
+import { test } from "node:test";
+
+const release = readFileSync(resolve(".github/workflows/images-release.yml"), "utf8");
+const row = readFileSync(resolve(".github/workflows/package-image-row.yml"), "utf8");
+const pinnedDepotSetupAction =
+  "uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1";
+const pinnedDepotBuildPushAction =
+  "uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1";
+
+function section(source: string, start: string, end?: string): string {
+  const from = source.indexOf(start);
+  assert.notEqual(from, -1, `missing section ${start}`);
+  const to = end ? source.indexOf(end, from + start.length) : source.length;
+  assert.notEqual(to, -1, `missing section boundary ${end}`);
+  return source.slice(from, to);
+}
+
+test("manual dispatch uses typed components and exact selectors", () => {
+  for (const input of [
+    "validate_native:",
+    "validate_homebrew:",
+    "validate_npm:",
+    "native_selector:",
+    "npm_selector:",
+  ]) {
+    assert.ok(release.includes(input), `missing ${input}`);
+  }
+  assert.doesNotMatch(release, /variant_filter|platform_filter|npm_lane_filter/);
+  assert.match(release, /scripts\/release-plan\.ts/);
+});
+
+test("manual dispatch can fail closed on an expected immutable upstream SHA", () => {
+  assert.match(release, /expected_mesh_sha:[\s\S]*required: false[\s\S]*type: string/);
+  const functionMatch = release.match(
+    /(validate_expected_mesh_sha\(\) \{[\s\S]*?^          \})/m,
+  );
+  assert.ok(functionMatch, "expected SHA validator function is missing");
+  const validator = functionMatch[1].replace(/^ {10}/gm, "");
+  const sha = "a".repeat(40);
+  const run = (expected: string, resolved = sha) => spawnSync(
+    "bash",
+    ["-c", `${validator}\nvalidate_expected_mesh_sha "$1" "$2"`, "test", expected, resolved],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(run("", sha).status, 0);
+  assert.equal(run(sha, sha).status, 0);
+  assert.notEqual(run("b".repeat(40), sha).status, 0);
+  assert.notEqual(run("A".repeat(40), sha).status, 0);
+  assert.notEqual(run("short", sha).status, 0);
+});
+
+test("identity-bound dispatch is all-or-none during legacy rollout", () => {
+  const meta = section(release, "      - id: meta", "      - id: matrix");
+  const guard = section(meta, '          [[ "$correlation_id"', '          release_json=')
+    .replace(/^ {10}/gm, "");
+  const run = (values: Record<string, string>) => spawnSync("bash", ["-c", `set -euo pipefail\n${guard}\nprintf '%s' "$correlation_id"`], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GITHUB_EVENT_NAME: "repository_dispatch", GITHUB_RUN_ID: "123", GITHUB_RUN_ATTEMPT: "1",
+      correlation_id: "manual-123-1", expected_mesh_sha: "", expected_manifest_sha256: "",
+      DISPATCH_EXPECTED_MESH_SHA: "", DISPATCH_EXPECTED_MANIFEST_SHA256: "", DISPATCH_CORRELATION_ID: "",
+      ...values,
+    },
+  });
+  const legacy = run({});
+  assert.equal(legacy.status, 0, legacy.stderr);
+  assert.equal(legacy.stdout, "legacy-123-1");
+  const bound = run({
+    expected_mesh_sha: "a".repeat(40), expected_manifest_sha256: "b".repeat(64),
+    DISPATCH_EXPECTED_MESH_SHA: "a".repeat(40),
+    DISPATCH_EXPECTED_MANIFEST_SHA256: "b".repeat(64),
+    DISPATCH_CORRELATION_ID: "mesh-123-1-v0.78.0", correlation_id: "mesh-123-1-v0.78.0",
+  });
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.equal(bound.stdout, "mesh-123-1-v0.78.0");
+  assert.notEqual(run({ DISPATCH_EXPECTED_MESH_SHA: "a".repeat(40) }).status, 0);
+  assert.notEqual(run({ DISPATCH_CORRELATION_ID: "mesh-123-1-v0.78.0" }).status, 0);
+});
+
+test("published release prerelease metadata is required and passed to the planner", () => {
+  const assignment = release.split("\n").find((line) => line.trimStart().startsWith('upstream_prerelease="$('));
+  assert.ok(assignment);
+  const run = (metadata: object) => spawnSync("bash", ["-euc", `${assignment}\nprintf '%s' "$upstream_prerelease"`], {
+    encoding: "utf8", env: { ...process.env, release_json: JSON.stringify(metadata) },
+  });
+  for (const prerelease of [true, false]) {
+    const result = run({ prerelease });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, String(prerelease));
+  }
+  for (const metadata of [{}, { prerelease: null }, { prerelease: "false" }]) {
+    assert.notEqual(run(metadata).status, 0);
+  }
+  assert.match(release, /echo "upstream_prerelease=\$upstream_prerelease"/);
+  assert.match(release, /UPSTREAM_PRERELEASE: \$\{\{ steps\.meta\.outputs\.upstream_prerelease \}\}/);
+  assert.match(release, /--upstream-prerelease "\$UPSTREAM_PRERELEASE"/);
+});
+
+test("terminal readiness records exact release identity and rejects every required npm failure", (t) => {
+  const step = section(release, "      - name: Record and enforce required results", "      - uses: actions/upload-artifact@v7");
+  const script = step.match(/        run: \|\n([\s\S]*)/)?.[1].replace(/^ {10}/gm, "");
+  assert.ok(script, "readiness shell is missing");
+  const cwd = mkdtempSync(resolve(tmpdir(), "packaging-readiness-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const env = {
+    ...process.env,
+    PLAN: "success", UPSTREAM: "success", NATIVE_ENABLED: "true", PACKAGE_IMAGES: "success",
+    HOMEBREW_ENABLED: "true", HOMEBREW: "success", ASSEMBLY_ENABLED: "true", RELEASE_ASSEMBLY: "success",
+    NPM_ENABLED: "true", NPM_ADDONS: "success", NPM_PACKAGE: "success", NPM_PREFLIGHT: "success",
+    PUBLISH_NPM_REQUESTED: "true", PUBLISH_NPM: "success",
+    PUBLISH_IMAGES_REQUESTED: "true", IMAGE_INDEX: "success", PROMOTE_IMAGES: "success",
+    PUBLISH_ASSETS_REQUESTED: "true", PUBLISH_ASSETS: "success",
+    CORRELATION_ID: "mesh-123-1-v0.78.0", MESH_REPOSITORY: "Mesh-LLM/mesh-llm",
+    MESH_REF: "v0.78.0", MESH_SHA: "a".repeat(40), MANIFEST_SHA256: "b".repeat(64),
+    GITHUB_RUN_ID: "456", GITHUB_RUN_ATTEMPT: "1",
+  };
+  const run = (overrides: Record<string, string> = {}) => spawnSync("bash", ["-c", script], {
+    cwd, env: { ...env, ...overrides }, encoding: "utf8",
+  });
+  assert.equal(run().status, 0);
+  const success = JSON.parse(readFileSync(resolve(cwd, "packaging-readiness.json"), "utf8"));
+  assert.equal(success.status, "success");
+  assert.equal(success.correlation_id, env.CORRELATION_ID);
+  assert.equal(success.packaging_run_id, 456);
+  assert.equal(success.upstream.sha, env.MESH_SHA);
+  assert.equal(success.upstream.manifest_sha256, env.MANIFEST_SHA256);
+  assert.deepEqual(success.requested, { publish_images: "true", publish_release_assets: "true", publish_npm: "true" });
+  assert.equal(success.results.npm_package, "success");
+  for (const [environment, resultField] of [
+    ["NPM_ADDONS", "npm_addons"], ["NPM_PACKAGE", "npm_package"], ["NPM_PREFLIGHT", "npm_preflight"],
+  ]) {
+    for (const outcome of ["failure", "cancelled", "skipped"]) {
+      const result = run({ [environment]: outcome, PUBLISH_NPM_REQUESTED: "false", PUBLISH_NPM: "skipped" });
+      assert.notEqual(result.status, 0, `${environment}=${outcome} must block npm readiness`);
+      const receipt = JSON.parse(readFileSync(resolve(cwd, "packaging-readiness.json"), "utf8"));
+      assert.equal(receipt.status, "failure");
+      assert.equal(receipt.results[resultField], outcome);
+    }
+  }
+  const disabled = run({
+    NPM_ENABLED: "false", NPM_ADDONS: "skipped", NPM_PACKAGE: "skipped", NPM_PREFLIGHT: "skipped",
+    PUBLISH_NPM_REQUESTED: "false", PUBLISH_NPM: "skipped",
+  });
+  assert.equal(disabled.status, 0, disabled.stderr);
+  assert.notEqual(run({ PUBLISH_NPM: "failure" }).status, 0);
+  const failure = JSON.parse(readFileSync(resolve(cwd, "packaging-readiness.json"), "utf8"));
+  assert.equal(failure.status, "failure");
+  assert.equal(failure.results.publish_npm, "failure");
+});
+
+test("each path builds once on Depot and QA binds the same identity", () => {
+  const packageJob = section(row, "  package:", "  dry-image:");
+  const dry = section(row, "  dry-image:", "  stage-image:");
+  const stage = section(row, "  stage-image:");
+  assert.equal(packageJob.split(pinnedDepotBuildPushAction).length - 1, 1);
+  assert.equal(dry.split(pinnedDepotBuildPushAction).length - 1, 1);
+  assert.equal(stage.split(pinnedDepotBuildPushAction).length - 1, 1);
+  assert.match(dry, /target: runtime[\s\S]*load: true/);
+  assert.match(dry, /docker image inspect --format '\{\{\.Id\}\}' "\$IMAGE_REF"/);
+  assert.match(stage, /push: true[\s\S]*staging-\$\{\{ github\.run_id \}\}/);
+  assert.match(stage, /IMAGE_REF: \$\{\{ inputs\.image_name \}\}@\$\{\{ steps\.stage\.outputs\.digest \}\}/);
+  assert.equal((stage.match(/"\$IMAGE_REF" \/tmp\/qa-runtime-image\.sh/g) ?? []).length, 1);
+  for (const imageJob of [dry, stage]) {
+    assert.match(imageJob, /MESH_LLM_SMOKE_MODE=auto sh \/tmp\/client-readiness-smoke\.sh/);
+    assert.match(imageJob, /NVIDIA_VISIBLE_DEVICES=\$\{\{ fromJSON\(inputs\.row_json\)\.nvidia_visible_devices \}\}/);
+    assert.match(imageJob, /NVIDIA_DRIVER_CAPABILITIES=\$\{\{ fromJSON\(inputs\.row_json\)\.nvidia_driver_capabilities \}\}/);
+  }
+  assert.match(stage, /qa:\{passed:true,image_digest:\$image_digest\}/);
+  assert.doesNotMatch(row, /runtime-qa|type=cacheonly/);
+});
+
+test("package and image BuildKit work uses the Depot project cache", () => {
+  const packageJob = section(row, "  package:", "  dry-image:");
+  const dry = section(row, "  dry-image:", "  stage-image:");
+  const stage = section(row, "  stage-image:");
+  assert.match(row, /DEPOT_PROJECT_ID: mzm95zcv7p/);
+  assert.equal(row.split(pinnedDepotSetupAction).length - 1, 3);
+  for (const job of [packageJob, dry, stage]) {
+    assert.match(job, new RegExp(pinnedDepotSetupAction.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(job, new RegExp(pinnedDepotBuildPushAction.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(job, /project: \$\{\{ env\.DEPOT_PROJECT_ID \}\}/);
+    const placement = job.match(/runs-on: >-\s*\$\{\{([\s\S]*?)\}\}/);
+    const measured = job.match(/RUNNER_LABELS_JSON: >-\s*\$\{\{ toJSON\(([\s\S]*?)\) \}\}/);
+    assert.ok(placement && measured);
+    assert.equal(measured[1].replace(/\s/g, ""), placement[1].replace(/\s/g, ""));
+    assert.match(job, /ACTUAL_RUNNER_NAME: \$\{\{ runner\.name \}\}/);
+    assert.match(job, /--argjson runner_labels "\$RUNNER_LABELS_JSON"/);
+    assert.match(job, /runner: \{labels: \$runner_labels, name: \$runner_name, environment: \$runner_environment\}/);
+    assert.doesNotMatch(job, /--arg runner_label/);
+    assert.doesNotMatch(job, /docker\/(?:setup-buildx-action|build-push-action)/);
+  }
+  assert.match(packageJob, /id: package[\s\S]*outputs: type=local,dest=artifacts\/native-package/);
+  assert.match(packageJob, /provenance: mode=max/);
+  assert.match(packageJob, /DEPOT_BUILD_ID: \$\{\{ steps\.package\.outputs\.build-id \}\}/);
+  assert.match(packageJob, /DEPOT_PROJECT_ID: \$\{\{ steps\.package\.outputs\.project-id \}\}/);
+  assert.match(packageJob, /https:\/\/meshllm\.cloud\/depot-build-receipt\/v1/);
+  assert.match(dry, /load: true/);
+  assert.doesNotMatch(stage, /outputs: type=local|load: true/);
+  assert.match(stage, /push:\s+true/);
+  assert.match(stage, /tags: \$\{\{ inputs\.image_name \}\}:staging-/);
+  assert.match(stage, /IMAGE_REF: \$\{\{ inputs\.image_name \}\}@\$\{\{ steps\.stage\.outputs\.digest \}\}/);
+  assert.doesNotMatch(row, /cache-(?:from|to): type=gha/);
+});
+
+test("pull-through bases are opt-in, trusted, digest-pinned, and short-lived", () => {
+  const packageJob = section(row, "  package:", "  dry-image:");
+  const dry = section(row, "  dry-image:", "  stage-image:");
+  const stage = section(row, "  stage-image:");
+
+  assert.match(packageJob, /CACHE_ENABLED: \$\{\{ vars\.DEPOT_REGISTRY_CACHE_ENABLED \}\}/);
+  assert.match(packageJob, /DEPOT_REGISTRY_HOST: \$\{\{ vars\.DEPOT_REGISTRY_HOST \}\}/);
+  assert.match(packageJob, /"\$REPOSITORY" == Mesh-LLM\/mesh-packaging/);
+  assert.match(packageJob, /"\$WORKFLOW_SOURCE_REF" == refs\/heads\/main/);
+  assert.match(packageJob, /images-release\.yml@refs\/heads\/main/);
+  assert.match(packageJob, /repository_dispatch\|workflow_dispatch/);
+  assert.match(packageJob, /package_base_image="\$DEPOT_REGISTRY_HOST\/\$PACKAGE_CACHE_REPOSITORY@\$\{package_base_image##\*@\}"/);
+  assert.match(packageJob, /runtime_base_image="\$DEPOT_REGISTRY_HOST\/\$RUNTIME_CACHE_REPOSITORY@\$\{runtime_base_image##\*@\}"/);
+  assert.match(packageJob, /Verify exact pull-through base manifests/);
+  assert.match(packageJob, /pull-through bases require a pre-authenticated Depot runner/);
+
+  for (const job of [packageJob, dry, stage]) {
+    assert.match(job, /vars\.DEPOT_REGISTRY_CACHE_ENABLED == 'true'/);
+    assert.match(job, /github\.repository == 'Mesh-LLM\/mesh-packaging'/);
+    assert.match(job, /github\.ref == 'refs\/heads\/main'/);
+    assert.match(job, /github\.workflow_ref == 'Mesh-LLM\/mesh-packaging\/\.github\/workflows\/images-release\.yml@refs\/heads\/main'/);
+    assert.match(job, /github\.event_name == 'workflow_dispatch'/);
+    assert.match(job, /github\.event_name == 'repository_dispatch'/);
+    assert.match(job, /depot-ubuntu-24\.04/);
+  }
+  assert.doesNotMatch(row, /depot pull-token|docker login "\$DEPOT_REGISTRY_HOST"|DEPOT_REGISTRY_PULL_TOKEN|secrets\.DEPOT|DEPOT_TOKEN/);
+  assert.match(dry, /RUNTIME_BASE_IMAGE=\$\{\{ needs\.package\.outputs\.runtime_base_image \}\}/);
+  assert.match(stage, /RUNTIME_BASE_IMAGE=\$\{\{ needs\.package\.outputs\.runtime_base_image \}\}/);
+});
+
+test("each Depot phase emits bounded tuning evidence without claiming unavailable metrics", () => {
+  const packageJob = section(row, "  package:", "  dry-image:");
+  const dry = section(row, "  dry-image:", "  stage-image:");
+  const stage = section(row, "  stage-image:");
+  for (const job of [packageJob, dry, stage]) {
+    assert.match(job, /Start Depot [^\n]+ measurement/);
+    assert.match(job, /context_bytes/);
+    assert.match(job, /action_seconds_json=null/);
+    assert.match(job, /context_bytes_json=null/);
+    assert.match(job, /DEPOT_BUILD_ID: \$\{\{ steps\.[a-z_]+\.outputs\.build-id \}\}/);
+    assert.match(job, /DEPOT_PROJECT_OUTPUT: \$\{\{ steps\.[a-z_]+\.outputs\.project-id \}\}/);
+    assert.match(job, /cache_state: \"unclassified\"/);
+    for (const metric of [
+      "cache_hit_rate",
+      "context_upload_seconds",
+      "cache_import_seconds",
+      "cache_export_seconds",
+      "cpu_utilization_percent",
+      "cost_usd",
+    ]) {
+      assert.match(job, new RegExp(`${metric}: null`));
+    }
+    assert.match(job, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7/);
+    assert.match(job, /retention-days: 14/);
+  }
+  assert.match(packageJob, /phase native-package/);
+  assert.match(dry, /phase runtime-image-dry/);
+  assert.match(stage, /phase runtime-image-stage/);
+});
+
+test("new reusable and image-index actions use immutable commits", () => {
+  const externalActionReferences = [...row.matchAll(
+    /^\s*(?:-\s+)?uses:\s*([^@\s]+)@([^\s#]+)/gm,
+  )];
+  assert.ok(externalActionReferences.length > 0);
+  for (const [, action, ref] of externalActionReferences) {
+    assert.match(ref, /^[0-9a-f]{40}$/, `${action} must use an immutable commit SHA`);
+  }
+  const index = section(release, "  image-index:", "  promote-images:");
+  for (const action of [
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7",
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+  ]) {
+    assert.ok(index.includes(action), `image index is missing immutable ${action}`);
+  }
+});
+
+test("dry validation cannot write to a registry", () => {
+  const caller = section(release, "  package-image:", "  homebrew:");
+  assert.match(caller, /permissions:[\s\S]*packages: write[\s\S]*id-token: write[\s\S]*attestations: write/);
+  assert.doesNotMatch(caller, /secrets:\s*inherit/);
+  const packageJob = section(row, "  package:", "  dry-image:");
+  const dry = section(row, "  dry-image:", "  stage-image:");
+  assert.match(packageJob, /permissions:\s+contents: read\s+id-token: write/);
+  assert.match(dry, /permissions:\s+contents: read\s+id-token: write/);
+  assert.doesNotMatch(dry, /packages: write|docker\/login-action|push: true/);
+  const stage = section(row, "  stage-image:");
+  assert.match(stage, /environment: release/);
+  assert.match(stage, /packages: write/);
+});
+
+test("promotion consumes the canonical tested index without rebuilding", () => {
+  const index = section(release, "  image-index:", "  promote-images:");
+  const promotion = section(release, "  promote-images:", "  release-assembly:");
+  assert.match(index, /scripts\/release-index\.ts assemble/);
+  assert.match(index, /scripts\/release-index\.ts verify/);
+  assert.match(promotion, /image-index\/release-index\.json/);
+  assert.match(promotion, /imagetools create --prefer-index=false/);
+  assert.match(promotion, /immutable version tag/);
+  assert.match(promotion, /rollback-ledger\.json/);
+  assert.doesNotMatch(promotion, /build-push-action|Dockerfile|docker buildx build/);
+});
+
+test("image index binds canonical source and pull references before promotion", () => {
+  const index = section(release, "  image-index:", "  promote-images:");
+  assert.match(index, /scripts\/image-base-plan\.ts/);
+  assert.match(index, /--matrix package-matrix\.json --results image-results/);
+  assert.match(index, /--mirror-enabled "\$MIRROR_ENABLED" --mirror-host "\$MIRROR_HOST"/);
+  assert.ok(index.indexOf("scripts/image-base-plan.ts") < index.indexOf("scripts/release-index.ts assemble"));
+  assert.match(row, /package_base_source="\$package_base_image"/);
+  assert.match(row, /runtime_base_source="\$runtime_base_image"/);
+  const stage = section(row, "  stage-image:");
+  assert.match(stage, /path: \|\s+image-row-result\.json\s+image-base-resolution\.json/);
+  assert.doesNotMatch(section(row, "  dry-image:", "  stage-image:"), /image-base-resolution\.json/);
+});
+
+test("publication reconstructs original artifact IDs from a small verified handoff", () => {
+  const assembly = section(release, "  release-assembly:", "  publish-release-assets:");
+  const publisher = section(release, "  publish-release-assets:", "  readiness:");
+  assert.match(assembly, /scripts\/release-handoff\.ts create/);
+  const upload = assembly.slice(assembly.lastIndexOf("      - uses: actions/upload-artifact"));
+  assert.match(upload, /release-handoff\.json/);
+  assert.doesNotMatch(upload, /release-upload|release-metadata/);
+  assert.match(publisher, /artifact-ids: \$\{\{ steps\.handoff\.outputs\.artifact_ids \}\}/);
+  assert.match(publisher, /cmp expected-package-matrix\.json assembled\/package-matrix\.json/);
+  assert.ok(publisher.indexOf("release-handoff.ts reconstruct") < publisher.indexOf("gh release create"));
+  assert.match(publisher, /environment: release/);
+});
+
+test("every native build receives immutable source epoch and every image selects exact package", () => {
+  assert.match(release, /source_date_epoch: \$\{\{ steps\.meta\.outputs\.source_date_epoch \}\}/);
+  assert.equal((row.match(/SOURCE_DATE_EPOCH=\$\{\{ inputs\.source_date_epoch \}\}/g) ?? []).length, 3);
+  assert.equal((row.match(/PACKAGE_FILE=\$\{\{ fromJSON\(inputs\.row_json\)\.package_file \}\}/g) ?? []).length, 2);
+});
+
+test("Node packaging consumes safe upstream addon artifacts without compiling", () => {
+  const addons = section(release, "  node-sdk-addon:", "  node-sdk-package:");
+  assert.match(addons, /scripts\/upstream-node-addon\.ts/);
+  assert.match(addons, /releases\/download\/\$MESH_REF/);
+  assert.doesNotMatch(addons, /rust-toolchain|sccache|build:native|cargo/);
+});
+
+test("Node prerelease validation uses a non-latest npm dist-tag", () => {
+  const assembly = section(release, "  node-sdk-package:", "  node-sdk-preflight:");
+  assert.match(assembly, /if \[\[ "\$MESH_VERSION" == \*-\* \]\]; then dist_tag=next; fi/);
+  assert.match(assembly, /npm publish "\.\/\$tarball" --dry-run --access public --tag "\$dist_tag"/);
+});
+
+test("every selected native npm target installs the same assembled tarball before publication", () => {
+  const assembly = section(release, "  node-sdk-package:", "  node-sdk-preflight:");
+  const preflight = section(release, "  node-sdk-preflight:", "  publish-node-sdk:");
+  const publisher = section(release, "  publish-node-sdk:", "  image-index:");
+  const readiness = section(release, "  readiness:");
+  const artifactName = "name: mesh-llm-node-sdk-npm-${{ needs.plan.outputs.mesh_version }}";
+  assert.equal((assembly.match(/npm pack --pack-destination/g) ?? []).length, 1);
+  assert.ok(assembly.includes(artifactName));
+  assert.match(preflight, /needs: \[plan, node-sdk-package\]/);
+  assert.match(preflight, /needs\.node-sdk-package\.result == 'success'/);
+  assert.match(preflight, /fail-fast: false/);
+  assert.match(preflight, /matrix: \$\{\{ fromJSON\(needs\.plan\.outputs\.npm_matrix\) \}\}/);
+  assert.match(preflight, /runs-on: \$\{\{ fromJSON\(matrix\.runner_labels\) \}\}/);
+  assert.match(preflight, /NODE_SDK_TARGET: \$\{\{ matrix\.target \}\}/);
+  assert.ok(preflight.includes(artifactName));
+  assert.doesNotMatch(preflight, /npm pack|scripts\/node-sdk-package\.ts|continue-on-error|linux-x64-assembled-package|\.targets \| index\("linux-x64"\)/);
+  assert.match(preflight, /shell: bash/);
+  assert.match(preflight, /shell: pwsh/);
+  assert.equal((preflight.match(/node-sdk-runtime-smoke\.cjs/g) ?? []).length, 2);
+  assert.match(preflight, /--target "\$NODE_SDK_TARGET"/);
+  assert.match(preflight, /--target "?\$env:NODE_SDK_TARGET"?/);
+  assert.equal((preflight.match(/npm install /g) ?? []).length, 2);
+  assert.ok(publisher.includes(artifactName));
+  assert.match(publisher, /needs: \[plan, node-sdk-package, node-sdk-preflight\]/);
+  assert.match(publisher, /needs\.node-sdk-preflight\.result == 'success'/);
+  assert.match(readiness, /needs: \[[^\n]*node-sdk-package[^\n]*node-sdk-preflight/);
+  assert.match(readiness, /NPM_PACKAGE: \$\{\{ needs\.node-sdk-package\.result \}\}/);
+  assert.match(readiness, /NPM_PREFLIGHT: \$\{\{ needs\.node-sdk-preflight\.result \}\}/);
+});
+
+test("readiness requires only explicitly enabled or requested components", () => {
+  const readiness = section(release, "  readiness:");
+  assert.match(readiness, /if \[\[ "\$NATIVE_ENABLED" == true \]\]/);
+  assert.match(readiness, /if \[\[ "\$HOMEBREW_ENABLED" == true \]\]/);
+  assert.match(readiness, /if \[\[ "\$NPM_ENABLED" == true \]\]/);
+  assert.match(readiness, /"\$IMAGE_INDEX" == success && "\$PROMOTE_IMAGES" == success/);
+});
