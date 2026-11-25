@@ -1,0 +1,1090 @@
+name: Mesh LLM Packaging Release
+run-name: Packaging · ${{ github.event.client_payload.correlation_id || inputs.mesh_ref || github.ref }}
+
+on:
+  repository_dispatch:
+    types: [mesh-llm-release]
+  workflow_dispatch:
+    inputs:
+      mesh_repository:
+        description: Upstream release repository
+        required: true
+        default: Mesh-LLM/mesh-llm
+        type: string
+      mesh_ref:
+        description: Published upstream release tag (for example v0.73.1)
+        required: true
+        type: string
+      mesh_version:
+        description: Release version (for example 0.73.1)
+        required: true
+        type: string
+      expected_mesh_sha:
+        description: Optional expected immutable upstream tag SHA (40 lowercase hexadecimal characters)
+        required: false
+        default: ''
+        type: string
+      expected_manifest_sha256:
+        description: Optional expected SHA-256 of the published upstream native-runtimes.json
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: Build and test everything without publishing
+        required: true
+        default: true
+        type: boolean
+      publish_images:
+        description: Publish OCI images to GHCR
+        required: true
+        default: false
+        type: boolean
+      publish_release_assets:
+        description: Publish native packages, SBOMs, checksums, and formula to this repository release
+        required: true
+        default: false
+        type: boolean
+      publish_npm:
+        description: Publish the assembled Node SDK package to npm
+        required: true
+        default: false
+        type: boolean
+      validate_native:
+        description: Validate native packages and runtime images
+        required: true
+        default: true
+        type: boolean
+      validate_homebrew:
+        description: Validate the Homebrew formula
+        required: true
+        default: false
+        type: boolean
+      validate_npm:
+        description: Validate Node SDK addon lanes and package assembly
+        required: true
+        default: false
+        type: boolean
+      native_selector:
+        description: Exact native artifact ID, comma-separated exact IDs, or all
+        required: true
+        default: all
+        type: string
+      npm_selector:
+        description: Exact Node SDK lane ID, comma-separated exact IDs, or all
+        required: true
+        default: all
+        type: string
+
+concurrency:
+  group: mesh-llm-packaging-${{ github.event.client_payload.ref || inputs.mesh_ref || github.ref }}-${{ inputs.dry_run || 'dispatch' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'ghcr.io/mesh-llm/mesh-llm' }}
+
+jobs:
+  plan:
+    name: Resolve immutable upstream release and matrices
+    runs-on: ubuntu-24.04
+    outputs:
+      package_matrix: ${{ steps.matrix.outputs.package_matrix }}
+      upstream_matrix: ${{ steps.matrix.outputs.upstream_matrix }}
+      homebrew_plan: ${{ steps.matrix.outputs.homebrew_plan }}
+      npm_matrix: ${{ steps.matrix.outputs.npm_matrix }}
+      npm_plan: ${{ steps.matrix.outputs.npm_plan }}
+      native_enabled: ${{ steps.matrix.outputs.native_enabled }}
+      homebrew_enabled: ${{ steps.matrix.outputs.homebrew_enabled }}
+      npm_enabled: ${{ steps.matrix.outputs.npm_enabled }}
+      mesh_repository: ${{ steps.meta.outputs.mesh_repository }}
+      mesh_ref: ${{ steps.meta.outputs.mesh_ref }}
+      mesh_sha: ${{ steps.meta.outputs.mesh_sha }}
+      manifest_sha256: ${{ steps.meta.outputs.manifest_sha256 }}
+      correlation_id: ${{ steps.meta.outputs.correlation_id }}
+      source_date_epoch: ${{ steps.meta.outputs.source_date_epoch }}
+      mesh_version: ${{ steps.meta.outputs.mesh_version }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      publish_images: ${{ steps.matrix.outputs.publish_images }}
+      publish_release_assets: ${{ steps.matrix.outputs.publish_release_assets }}
+      publish_npm: ${{ steps.matrix.outputs.publish_npm }}
+      release_assembly_enabled: ${{ steps.matrix.outputs.release_assembly_enabled }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_REPOSITORY: ${{ github.event.client_payload.repository }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          DISPATCH_EXPECTED_MESH_SHA: ${{ github.event.client_payload.expected_mesh_sha }}
+          DISPATCH_EXPECTED_MANIFEST_SHA256: ${{ github.event.client_payload.expected_manifest_sha256 }}
+          DISPATCH_CORRELATION_ID: ${{ github.event.client_payload.correlation_id }}
+          DISPATCH_DRY_RUN: ${{ github.event.client_payload.dry_run }}
+          DISPATCH_PUBLISH_IMAGES: ${{ github.event.client_payload.publish_images }}
+          DISPATCH_PUBLISH_RELEASE_ASSETS: ${{ github.event.client_payload.publish_release_assets }}
+          DISPATCH_PUBLISH_NPM: ${{ github.event.client_payload.publish_npm }}
+          INPUT_REPOSITORY: ${{ inputs.mesh_repository }}
+          INPUT_REF: ${{ inputs.mesh_ref }}
+          INPUT_VERSION: ${{ inputs.mesh_version }}
+          INPUT_EXPECTED_MESH_SHA: ${{ inputs.expected_mesh_sha }}
+          INPUT_EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_PUBLISH_IMAGES: ${{ inputs.publish_images }}
+          INPUT_PUBLISH_RELEASE_ASSETS: ${{ inputs.publish_release_assets }}
+          INPUT_PUBLISH_NPM: ${{ inputs.publish_npm }}
+          INPUT_VALIDATE_NATIVE: ${{ inputs.validate_native }}
+          INPUT_VALIDATE_HOMEBREW: ${{ inputs.validate_homebrew }}
+          INPUT_VALIDATE_NPM: ${{ inputs.validate_npm }}
+          INPUT_NATIVE_SELECTOR: ${{ inputs.native_selector }}
+          INPUT_NPM_SELECTOR: ${{ inputs.npm_selector }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${DISPATCH_REPOSITORY:-${INPUT_REPOSITORY:-Mesh-LLM/mesh-llm}}"
+          ref="${DISPATCH_REF:-${INPUT_REF:-}}"
+          version="${DISPATCH_VERSION:-${INPUT_VERSION:-}}"
+          expected_mesh_sha="${DISPATCH_EXPECTED_MESH_SHA:-${INPUT_EXPECTED_MESH_SHA:-}}"
+          expected_manifest_sha256="${DISPATCH_EXPECTED_MANIFEST_SHA256:-${INPUT_EXPECTED_MANIFEST_SHA256:-}}"
+          correlation_id="${DISPATCH_CORRELATION_ID:-manual-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          dry_run="${DISPATCH_DRY_RUN:-${INPUT_DRY_RUN:-true}}"
+          publish_images="${DISPATCH_PUBLISH_IMAGES:-${INPUT_PUBLISH_IMAGES:-false}}"
+          publish_release_assets="${DISPATCH_PUBLISH_RELEASE_ASSETS:-${INPUT_PUBLISH_RELEASE_ASSETS:-false}}"
+          publish_npm="${DISPATCH_PUBLISH_NPM:-${INPUT_PUBLISH_NPM:-false}}"
+          if [[ "$GITHUB_EVENT_NAME" == repository_dispatch ]]; then
+            validate_native=true
+            validate_homebrew="$publish_release_assets"
+            validate_npm="$publish_npm"
+            native_selector=all
+            npm_selector=all
+          else
+            validate_native="${INPUT_VALIDATE_NATIVE:-true}"
+            validate_homebrew="${INPUT_VALIDATE_HOMEBREW:-false}"
+            validate_npm="${INPUT_VALIDATE_NPM:-false}"
+            native_selector="${INPUT_NATIVE_SELECTOR:-all}"
+            npm_selector="${INPUT_NPM_SELECTOR:-all}"
+          fi
+
+          [[ "$repository" == "Mesh-LLM/mesh-llm" ]] || { echo "only Mesh-LLM/mesh-llm is accepted" >&2; exit 1; }
+          [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "mesh_ref must be a release tag" >&2; exit 1; }
+          [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "mesh_version must be semver" >&2; exit 1; }
+          version="${version#v}"
+          [[ "$ref" == "v$version" ]] || { echo "mesh_ref and mesh_version disagree" >&2; exit 1; }
+          [[ "$dry_run" == true || "$dry_run" == false ]] || { echo "dry_run must be boolean" >&2; exit 1; }
+          [[ "$publish_images" == true || "$publish_images" == false ]] || { echo "publish_images must be boolean" >&2; exit 1; }
+          [[ "$publish_release_assets" == true || "$publish_release_assets" == false ]] || { echo "publish_release_assets must be boolean" >&2; exit 1; }
+          [[ "$publish_npm" == true || "$publish_npm" == false ]] || { echo "publish_npm must be boolean" >&2; exit 1; }
+          [[ "$correlation_id" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { echo "invalid release correlation_id" >&2; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == repository_dispatch ]]; then
+            if [[ -n "${DISPATCH_EXPECTED_MESH_SHA:-}" || -n "${DISPATCH_EXPECTED_MANIFEST_SHA256:-}" || -n "${DISPATCH_CORRELATION_ID:-}" ]]; then
+              [[ "$expected_mesh_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "identity-bound dispatch requires expected_mesh_sha" >&2; exit 1; }
+              [[ "$expected_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "identity-bound dispatch requires expected_manifest_sha256" >&2; exit 1; }
+              [[ -n "${DISPATCH_CORRELATION_ID:-}" ]] || { echo "identity-bound dispatch requires correlation_id" >&2; exit 1; }
+            else
+              # Keep current upstream releases working while the coordinated
+              # identity-bound dispatcher is reviewed and merged.
+              correlation_id="legacy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            fi
+          fi
+
+          release_json="$(gh api "repos/$repository/releases/tags/$ref")"
+          [[ "$(jq -r .draft <<<"$release_json")" == false ]] || { echo "upstream release is still a draft" >&2; exit 1; }
+          upstream_prerelease="$(jq -er '.prerelease | if type == "boolean" then tostring else error("upstream prerelease must be boolean") end' <<<"$release_json")"
+          mesh_sha="$(git ls-remote "https://github.com/$repository.git" "refs/tags/$ref^{}" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$mesh_sha" ]]; then
+            mesh_sha="$(git ls-remote "https://github.com/$repository.git" "refs/tags/$ref" | awk 'NR == 1 { print $1 }')"
+          fi
+          [[ "$mesh_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve immutable upstream tag SHA" >&2; exit 1; }
+          validate_expected_mesh_sha() {
+            local expected="$1"
+            local resolved="$2"
+            [[ -z "$expected" ]] && return 0
+            [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "expected_mesh_sha must be 40 lowercase hexadecimal characters" >&2
+              return 1
+            }
+            [[ "$expected" == "$resolved" ]] || {
+              echo "resolved upstream tag SHA $resolved does not match expected_mesh_sha $expected" >&2
+              return 1
+            }
+          }
+          validate_expected_mesh_sha "$expected_mesh_sha" "$mesh_sha"
+          manifest_file="$RUNNER_TEMP/native-runtimes.json"
+          gh release download "$ref" --repo "$repository" --pattern native-runtimes.json --dir "$RUNNER_TEMP" --clobber
+          [[ -s "$manifest_file" ]] || { echo "upstream native runtime manifest is missing" >&2; exit 1; }
+          manifest_sha256="$(sha256sum "$manifest_file" | cut -d ' ' -f 1)"
+          if [[ -n "$expected_manifest_sha256" ]]; then
+            [[ "$expected_manifest_sha256" =~ ^[0-9a-f]{64}$ && "$manifest_sha256" == "$expected_manifest_sha256" ]] || {
+              echo "upstream native runtime manifest digest does not match dispatch" >&2
+              exit 1
+            }
+          fi
+          source_date_epoch="$(gh api "repos/$repository/commits/$mesh_sha" --jq '.commit.committer.date' | xargs -I{} date -u -d '{}' +%s)"
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || { echo "invalid immutable source epoch" >&2; exit 1; }
+
+          {
+            echo "mesh_repository=$repository"
+            echo "mesh_ref=$ref"
+            echo "mesh_sha=$mesh_sha"
+            echo "manifest_sha256=$manifest_sha256"
+            echo "correlation_id=$correlation_id"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "mesh_version=$version"
+            echo "dry_run=$dry_run"
+            echo "upstream_prerelease=$upstream_prerelease"
+            echo "publish_images=$publish_images"
+            echo "publish_release_assets=$publish_release_assets"
+            echo "publish_npm=$publish_npm"
+            echo "validate_native=$validate_native"
+            echo "validate_homebrew=$validate_homebrew"
+            echo "validate_npm=$validate_npm"
+            echo "native_selector=$native_selector"
+            echo "npm_selector=$npm_selector"
+          } >> "$GITHUB_OUTPUT"
+      - id: matrix
+        env:
+          VERSION: ${{ steps.meta.outputs.mesh_version }}
+          REF: ${{ steps.meta.outputs.mesh_ref }}
+          REPOSITORY: ${{ steps.meta.outputs.mesh_repository }}
+          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
+          UPSTREAM_PRERELEASE: ${{ steps.meta.outputs.upstream_prerelease }}
+          PUBLISH_IMAGES: ${{ steps.meta.outputs.publish_images }}
+          PUBLISH_RELEASE_ASSETS: ${{ steps.meta.outputs.publish_release_assets }}
+          PUBLISH_NPM: ${{ steps.meta.outputs.publish_npm }}
+          VALIDATE_NATIVE: ${{ steps.meta.outputs.validate_native }}
+          VALIDATE_HOMEBREW: ${{ steps.meta.outputs.validate_homebrew }}
+          VALIDATE_NPM: ${{ steps.meta.outputs.validate_npm }}
+          NATIVE_SELECTOR: ${{ steps.meta.outputs.native_selector }}
+          NPM_SELECTOR: ${{ steps.meta.outputs.npm_selector }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan="$(node --experimental-strip-types scripts/release-plan.ts \
+            --version "$VERSION" \
+            --mesh-ref "$REF" \
+            --mesh-repository "$REPOSITORY" \
+            --image "$IMAGE_NAME" \
+            --dry-run "$DRY_RUN" \
+            --upstream-prerelease "$UPSTREAM_PRERELEASE" \
+            --publish-images "$PUBLISH_IMAGES" \
+            --publish-release-assets "$PUBLISH_RELEASE_ASSETS" \
+            --publish-npm "$PUBLISH_NPM" \
+            --validate-native "$VALIDATE_NATIVE" \
+            --validate-homebrew "$VALIDATE_HOMEBREW" \
+            --validate-npm "$VALIDATE_NPM" \
+            --native-selector "$NATIVE_SELECTOR" \
+            --npm-selector "$NPM_SELECTOR")"
+          {
+            echo "package_matrix=$(jq -c .package_matrix <<<"$plan")"
+            echo "upstream_matrix=$(jq -c .upstream_matrix <<<"$plan")"
+            echo "homebrew_plan=$(jq -c .homebrew_plan <<<"$plan")"
+            echo "npm_matrix=$(jq -c .npm_matrix <<<"$plan")"
+            echo "npm_plan=$(jq -c .npm_plan <<<"$plan")"
+            echo "native_enabled=$(jq -r .native_enabled <<<"$plan")"
+            echo "homebrew_enabled=$(jq -r .homebrew_enabled <<<"$plan")"
+            echo "npm_enabled=$(jq -r .npm_enabled <<<"$plan")"
+            echo "publish_images=$(jq -r .publish_images <<<"$plan")"
+            echo "publish_release_assets=$(jq -r .publish_release_assets <<<"$plan")"
+            echo "publish_npm=$(jq -r .publish_npm <<<"$plan")"
+            echo "release_assembly_enabled=$(jq -r .release_assembly_enabled <<<"$plan")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Verify producer product-v2 schema
+        if: steps.matrix.outputs.native_enabled == 'true' || steps.matrix.outputs.homebrew_enabled == 'true'
+        env:
+          MESH_SHA: ${{ steps.meta.outputs.mesh_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          producer_schema="artifacts/producer-product-v2.schema.json"
+          mkdir -p artifacts
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$producer_schema" \
+            "https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/${MESH_SHA}/schemas/product-v2.schema.json"
+          node --experimental-strip-types scripts/verify-product-schema.ts \
+            --producer-schema "$producer_schema" \
+            --consumer-schema schemas/product-v2.schema.json
+
+  upstream:
+    name: Verify upstream ${{ matrix.upstream_asset_name }}
+    if: needs.plan.outputs.native_enabled == 'true'
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.upstream_matrix) }}
+    runs-on: ${{ fromJSON(matrix.runner_labels) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Download archive and checksum sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p downloads artifacts/upstream
+          curl --fail --location --retry 3 --output "downloads/${{ matrix.upstream_asset_name }}" "${{ matrix.upstream_asset_url }}"
+          curl --fail --location --retry 3 --output "downloads/${{ matrix.upstream_checksum_name }}" "${{ matrix.upstream_checksum_url }}"
+          node --experimental-strip-types scripts/upstream-archive.ts \
+            --archive "downloads/${{ matrix.upstream_asset_name }}" \
+            --checksum "downloads/${{ matrix.upstream_checksum_name }}" \
+            --output-dir artifacts/upstream \
+            --source-url "${{ matrix.upstream_asset_url }}" \
+            --version "${{ matrix.mesh_version }}" \
+            --flavor "${{ matrix.upstream_flavor }}"
+          mkdir -p artifacts/provenance
+          jq --arg arch "${{ matrix.arch }}" --arg platform "${{ matrix.platform }}" \
+            '. + {arch: $arch, platform: $platform}' \
+            artifacts/upstream/upstream-provenance.json \
+            > "artifacts/provenance/${{ matrix.upstream_artifact_id }}.json"
+          file artifacts/upstream/mesh-llm | grep -q 'ELF.*executable'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.upstream_artifact_id }}
+          path: artifacts/upstream
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mesh-llm-upstream-provenance-${{ matrix.upstream_artifact_id }}
+          path: artifacts/provenance/${{ matrix.upstream_artifact_id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  upstream-host-invariant:
+    name: Verify one immutable host per platform and architecture
+    if: needs.plan.outputs.native_enabled == 'true'
+    needs: [plan, upstream]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mesh-llm-upstream-provenance-*
+          path: artifacts/upstream-provenance
+          merge-multiple: true
+      - name: Reject backend products with different verified host bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t provenance_files < <(find artifacts/upstream-provenance -type f -name '*.json' -print0 | sort -z)
+          (( ${#provenance_files[@]} > 0 )) || { echo "no upstream provenance records downloaded" >&2; exit 1; }
+          node --experimental-strip-types scripts/verify-host-invariant.ts "${provenance_files[@]}"
+
+  package-image:
+    name: Package and image ${{ matrix.artifact_id }}
+    if: needs.plan.outputs.native_enabled == 'true'
+    needs: [plan, upstream, upstream-host-invariant]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.package_matrix) }}
+    uses: ./.github/workflows/package-image-row.yml
+    with:
+      row_json: ${{ toJSON(matrix) }}
+      image_name: ${{ vars.IMAGE_NAME || 'ghcr.io/mesh-llm/mesh-llm' }}
+      mesh_ref: ${{ needs.plan.outputs.mesh_ref }}
+      mesh_sha: ${{ needs.plan.outputs.mesh_sha }}
+      source_date_epoch: ${{ needs.plan.outputs.source_date_epoch }}
+      publish_images: ${{ needs.plan.outputs.publish_images == 'true' }}
+
+  homebrew:
+    name: Verify Homebrew formula from upstream macOS archive
+    if: needs.plan.outputs.homebrew_enabled == 'true'
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.homebrew_plan).runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Download, verify, and render formula
+        env:
+          PLAN: ${{ needs.plan.outputs.homebrew_plan }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(jq -r .upstream_asset_name <<<"$PLAN")"
+          checksum="$(jq -r .upstream_checksum_name <<<"$PLAN")"
+          asset_url="$(jq -r .upstream_asset_url <<<"$PLAN")"
+          checksum_url="$(jq -r .upstream_checksum_url <<<"$PLAN")"
+          curl --fail --location --retry 3 --output "$asset" "$asset_url"
+          curl --fail --location --retry 3 --output "$checksum" "$checksum_url"
+          node --experimental-strip-types scripts/upstream-archive.ts --archive "$asset" --checksum "$checksum" --output-dir verified --source-url "$asset_url" --version "${{ needs.plan.outputs.mesh_version }}" --flavor metal
+          digest="$(jq -r .sha256 verified/upstream-provenance.json)"
+          node --experimental-strip-types scripts/homebrew-release.ts --version "${{ needs.plan.outputs.mesh_version }}" --sha256 "$digest" --formula-output artifacts/homebrew/Formula/mesh-llm.rb
+          # The hosted image currently carries an unrelated untrusted AWS tap.
+          brew untap aws/tap >/dev/null 2>&1 || true
+          brew tap-new mesh-llm/packaging-validation
+          tap_formula="$(brew --repository)/Library/Taps/mesh-llm/homebrew-packaging-validation/Formula/mesh-llm.rb"
+          cp artifacts/homebrew/Formula/mesh-llm.rb "$tap_formula"
+          brew trust --formula mesh-llm/packaging-validation/mesh-llm
+          brew audit --strict --online mesh-llm/packaging-validation/mesh-llm
+          brew install --formula mesh-llm/packaging-validation/mesh-llm
+          brew test mesh-llm/packaging-validation/mesh-llm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mesh-llm-homebrew-${{ needs.plan.outputs.mesh_version }}
+          path: artifacts/homebrew
+          if-no-files-found: error
+          retention-days: 14
+
+  node-sdk-addon:
+    name: Verify upstream Node SDK addon ${{ matrix.name }}
+    if: needs.plan.outputs.npm_enabled == 'true'
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.npm_matrix) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Download, verify, and safely extract immutable addon
+        shell: bash
+        env:
+          MESH_VERSION: ${{ needs.plan.outputs.mesh_version }}
+          NODE_SDK_TARGET: ${{ matrix.target }}
+          MESH_REPOSITORY: ${{ needs.plan.outputs.mesh_repository }}
+          MESH_REF: ${{ needs.plan.outputs.mesh_ref }}
+        run: |
+          set -euo pipefail
+          archive="mesh-llm-node-sdk-addon-$MESH_VERSION-$NODE_SDK_TARGET.tar.gz"
+          url="https://github.com/$MESH_REPOSITORY/releases/download/$MESH_REF/$archive"
+          mkdir -p downloads artifacts/node-sdk-addons
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "downloads/$archive" "$url"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "downloads/$archive.sha256" "$url.sha256"
+          node --experimental-strip-types scripts/upstream-node-addon.ts \
+            --archive "downloads/$archive" \
+            --checksum "downloads/$archive.sha256" \
+            --output-dir artifacts/node-sdk-addons \
+            --target "$NODE_SDK_TARGET" \
+            --version "$MESH_VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/node-sdk-addons
+          if-no-files-found: error
+          retention-days: 14
+
+  node-sdk-package:
+    name: Assemble and dry-run publish Node SDK npm package
+    if: always() && needs.plan.outputs.npm_enabled == 'true' && needs.node-sdk-addon.result == 'success'
+    needs: [plan, node-sdk-addon]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.plan.outputs.mesh_repository }}
+          ref: ${{ needs.plan.outputs.mesh_sha }}
+          path: upstream-source
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download Node SDK addons
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mesh-llm-node-sdk-addon-${{ needs.plan.outputs.mesh_version }}-*
+          path: artifacts/node-sdk-addons
+          merge-multiple: true
+      - name: Verify tagged Node SDK console assets
+        run: node --experimental-strip-types scripts/verify-node-sdk-source.ts --source-root upstream-source
+      - name: Assemble Node SDK package
+        env:
+          NPM_PLAN: ${{ needs.plan.outputs.npm_plan }}
+          MESH_VERSION: ${{ needs.plan.outputs.mesh_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets="$(jq -r '.targets | join(",")' <<<"$NPM_PLAN")"
+          node --experimental-strip-types scripts/node-sdk-package.ts \
+            --source-root upstream-source \
+            --addon-root artifacts/node-sdk-addons \
+            --output-dir artifacts/node-sdk-package \
+            --expected-version "$MESH_VERSION" \
+            --targets "$targets"
+      - name: Test, pack, and dry-run publish
+        timeout-minutes: 5
+        env:
+          MESH_VERSION: ${{ needs.plan.outputs.mesh_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test --prefix artifacts/node-sdk-package
+          mkdir -p artifacts/npm
+          (
+            cd artifacts/node-sdk-package
+            npm pack --pack-destination "$GITHUB_WORKSPACE/artifacts/npm"
+          )
+          tarball="$(find artifacts/npm -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          if npm view "@mesh-llm/sdk@$MESH_VERSION" version >/dev/null 2>&1; then
+            echo "@mesh-llm/sdk@$MESH_VERSION is already published; skipping publish dry-run"
+          else
+            dist_tag=latest
+            if [[ "$MESH_VERSION" == *-* ]]; then dist_tag=next; fi
+            npm publish "./$tarball" --dry-run --access public --tag "$dist_tag" --provenance=false
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mesh-llm-node-sdk-npm-${{ needs.plan.outputs.mesh_version }}
+          path: artifacts/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+  node-sdk-preflight:
+    name: Install and start Node SDK ${{ matrix.name }}
+    if: always() && needs.plan.outputs.npm_enabled == 'true' && needs.node-sdk-package.result == 'success'
+    needs: [plan, node-sdk-package]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.npm_matrix) }}
+    runs-on: ${{ fromJSON(matrix.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-llm-node-sdk-npm-${{ needs.plan.outputs.mesh_version }}
+          path: artifacts/npm
+      - name: Install and exercise the assembled package on Unix
+        if: runner.os != 'Windows'
+        timeout-minutes: 5
+        env:
+          MESH_VERSION: ${{ needs.plan.outputs.mesh_version }}
+          NODE_SDK_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarballs=(artifacts/npm/*.tgz)
+          [[ ${#tarballs[@]} -eq 1 && -f "${tarballs[0]}" ]] || { echo "expected one assembled npm tarball" >&2; exit 1; }
+          tarball="$GITHUB_WORKSPACE/${tarballs[0]}"
+          mkdir consumer
+          cd consumer
+          npm init --yes >/dev/null
+          npm install "$tarball"
+          node "$GITHUB_WORKSPACE/scripts/node-sdk-runtime-smoke.cjs" \
+            --package-root "$PWD" --expected-version "$MESH_VERSION" \
+            --target "$NODE_SDK_TARGET"
+      - name: Install and exercise the assembled package on Windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        env:
+          MESH_VERSION: ${{ needs.plan.outputs.mesh_version }}
+          NODE_SDK_TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tarballs = @(Get-ChildItem -LiteralPath artifacts/npm -Filter '*.tgz' -File)
+          if ($tarballs.Count -ne 1) { throw 'expected one assembled npm tarball' }
+          $tarball = $tarballs[0].FullName
+          New-Item -ItemType Directory -Path consumer | Out-Null
+          Push-Location consumer
+          try {
+            npm init --yes | Out-Null
+            npm install $tarball
+            node "$env:GITHUB_WORKSPACE/scripts/node-sdk-runtime-smoke.cjs" `
+              --package-root (Get-Location).Path --expected-version $env:MESH_VERSION `
+              --target $env:NODE_SDK_TARGET
+          } finally {
+            Pop-Location
+          }
+
+  publish-node-sdk:
+    name: Publish Node SDK to npm
+    if: always() && needs.plan.outputs.publish_npm == 'true' && needs.node-sdk-package.result == 'success' && needs.node-sdk-preflight.result == 'success'
+    needs: [plan, node-sdk-package, node-sdk-preflight]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-llm-node-sdk-npm-${{ needs.plan.outputs.mesh_version }}
+          path: artifacts/npm
+      - name: Publish Node SDK package
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.mesh_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "@mesh-llm/sdk@$RELEASE_VERSION" version >/dev/null 2>&1; then
+            echo "@mesh-llm/sdk@$RELEASE_VERSION is already published"
+            exit 0
+          fi
+          dist_tag=latest
+          if [[ "$RELEASE_VERSION" == *-* ]]; then dist_tag=next; fi
+          tarball="$(find artifacts/npm -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          npm publish "./$tarball" --access public --tag "$dist_tag" --provenance
+
+  image-index:
+    name: Assemble exact tested image index
+    if: needs.plan.outputs.publish_images == 'true'
+    needs: [plan, package-image]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: mesh-llm-image-result-*
+          path: image-results
+      - name: Bind every staged result to the selected matrix
+        env:
+          MIRROR_ENABLED: ${{ vars.DEPOT_REGISTRY_CACHE_ENABLED == 'true' && 'true' || 'false' }}
+          MIRROR_HOST: ${{ vars.DEPOT_REGISTRY_HOST }}
+          PACKAGE_MATRIX: ${{ needs.plan.outputs.package_matrix }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.plan.outputs.mesh_version }}
+          MESH_REF: ${{ needs.plan.outputs.mesh_ref }}
+          MESH_SHA: ${{ needs.plan.outputs.mesh_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PACKAGE_MATRIX" > package-matrix.json
+          node --experimental-strip-types scripts/image-base-plan.ts \
+            --matrix package-matrix.json --results image-results \
+            --version "$VERSION" --mesh-ref "$MESH_REF" --mesh-sha "$MESH_SHA" \
+            --packaging-sha "$GITHUB_SHA" --image-name "$IMAGE_NAME" \
+            --mirror-enabled "$MIRROR_ENABLED" --mirror-host "$MIRROR_HOST" \
+            --output image-release-plan.json
+          node --experimental-strip-types scripts/release-index.ts assemble \
+            --plan image-release-plan.json \
+            --results image-results \
+            --output release-index.json
+          node --experimental-strip-types scripts/release-index.ts verify \
+            --plan image-release-plan.json \
+            --results image-results \
+            --index release-index.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mesh-llm-image-index-${{ needs.plan.outputs.mesh_version }}
+          path: |
+            image-release-plan.json
+            release-index.json
+          if-no-files-found: error
+          retention-days: 14
+
+  promote-images:
+    name: Promote exact tested image digests
+    if: needs.plan.outputs.publish_images == 'true'
+    needs: [plan, image-index]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-llm-image-index-${{ needs.plan.outputs.mesh_version }}
+          path: image-index
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote without rebuilding and record rollback state
+        env:
+          VERSION: ${{ needs.plan.outputs.mesh_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_digest() {
+            local ref="$1"
+            local raw
+            raw="$(mktemp)"
+            if ! docker buildx imagetools inspect "$ref" --raw > "$raw" 2>/dev/null; then
+              rm -f "$raw"
+              return 1
+            fi
+            printf 'sha256:%s' "$(sha256sum "$raw" | awk '{ print $1 }')"
+            rm -f "$raw"
+          }
+          printf '[]\n' > rollback-ledger.json
+          while IFS= read -r encoded; do
+            row="$(printf '%s' "$encoded" | base64 --decode)"
+            image_name="$(jq -er .image.name <<<"$row")"
+            digest="$(jq -er .image.digest <<<"$row")"
+            source_ref="$image_name@$digest"
+            [[ "$(manifest_digest "$source_ref")" == "$digest" ]] || {
+              echo "staged source digest no longer resolves exactly: $source_ref" >&2
+              exit 1
+            }
+            while IFS= read -r tag; do
+              previous=null
+              if existing="$(manifest_digest "$tag")"; then previous="$existing"; fi
+              if [[ "$tag" == *":$VERSION-"* && "$previous" != null && "$previous" != "$digest" ]]; then
+                echo "immutable version tag $tag already resolves to $previous, expected $digest" >&2
+                exit 1
+              fi
+              if [[ "$previous" != "$digest" ]]; then
+                docker buildx imagetools create --prefer-index=false --tag "$tag" "$source_ref"
+              fi
+              [[ "$(manifest_digest "$tag")" == "$digest" ]] || {
+                echo "promoted tag $tag does not resolve to $digest" >&2
+                exit 1
+              }
+              jq --arg tag "$tag" --arg digest "$digest" --arg previous "$previous" \
+                '. + [{tag:$tag,previous_digest:(if $previous == "null" then null else $previous end),promoted_digest:$digest}]' \
+                rollback-ledger.json > rollback-ledger.next.json
+              mv rollback-ledger.next.json rollback-ledger.json
+            done < <(jq -r '.tags[]' <<<"$row")
+          done < <(jq -r '.rows[] | @base64' image-index/release-index.json)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: mesh-llm-image-promotion-${{ needs.plan.outputs.mesh_version }}
+          path: |
+            image-index/release-index.json
+            rollback-ledger.json
+          if-no-files-found: error
+          retention-days: 30
+
+  release-assembly:
+    name: Assemble immutable native package release evidence
+    permissions:
+      contents: read
+      actions: read
+    if: needs.plan.outputs.release_assembly_enabled == 'true'
+    needs: [plan, package-image, homebrew]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mesh-llm-package-*
+          path: release-assets/native
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-llm-homebrew-${{ needs.plan.outputs.mesh_version }}
+          path: release-assets/homebrew
+      - name: Assemble and verify the exact 11-package release
+        env:
+          PACKAGE_MATRIX: ${{ needs.plan.outputs.package_matrix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PACKAGE_MATRIX" > package-matrix.json
+          node --experimental-strip-types scripts/release-evidence.ts assemble \
+            --input release-assets/native \
+            --homebrew release-assets/homebrew \
+            --matrix package-matrix.json \
+            --output release-upload \
+            --metadata release-metadata \
+            --version "${{ needs.plan.outputs.mesh_version }}" \
+            --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
+            --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" \
+            --packaging-sha "$GITHUB_SHA"
+      - name: Bind original artifacts and verified release hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            | jq '[.[].artifacts[]]' > artifact-inventory.json
+          node --experimental-strip-types scripts/release-handoff.ts create \
+            --output release-upload --matrix package-matrix.json \
+            --inventory artifact-inventory.json --manifest release-handoff.json \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --version "${{ needs.plan.outputs.mesh_version }}" \
+            --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
+            --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mesh-llm-release-handoff-${{ needs.plan.outputs.mesh_version }}
+          path: |
+            release-handoff.json
+            package-matrix.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release-assets:
+    name: Publish immutable native package release assets
+    if: needs.plan.outputs.publish_release_assets == 'true'
+    needs: [plan, release-assembly]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: mesh-llm-release-handoff-${{ needs.plan.outputs.mesh_version }}
+          path: assembled
+      - name: Validate original artifact handoff
+        id: handoff
+        env:
+          PACKAGE_MATRIX: ${{ needs.plan.outputs.package_matrix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PACKAGE_MATRIX" > expected-package-matrix.json
+          cmp expected-package-matrix.json assembled/package-matrix.json
+          artifact_ids="$(node --experimental-strip-types scripts/release-handoff.ts prepare \
+            --manifest assembled/release-handoff.json --matrix assembled/package-matrix.json \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --version "${{ needs.plan.outputs.mesh_version }}" \
+            --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
+            --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA")"
+          echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ steps.handoff.outputs.artifact_ids }}
+          path: release-inputs
+      - name: Reconstruct and re-verify exact release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/release-handoff.ts reconstruct \
+            --manifest assembled/release-handoff.json --matrix assembled/package-matrix.json \
+            --input release-inputs --output assembled/release-upload \
+            --metadata assembled/release-metadata \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --version "${{ needs.plan.outputs.mesh_version }}" \
+            --mesh-ref "${{ needs.plan.outputs.mesh_ref }}" \
+            --mesh-sha "${{ needs.plan.outputs.mesh_sha }}" --packaging-sha "$GITHUB_SHA"
+      - name: Fail closed or select immutable create
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: packaging-v${{ needs.plan.outputs.mesh_version }}
+          TITLE: mesh-llm ${{ needs.plan.outputs.mesh_version }} packages
+          BODY: Packages derived from verified Mesh-LLM/mesh-llm ${{ needs.plan.outputs.mesh_ref }} at ${{ needs.plan.outputs.mesh_sha }}.
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$BODY" > release-body.md
+          api_url="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          status="$(curl --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output existing-release.json \
+            --write-out '%{http_code}' \
+            "$api_url")"
+          if [[ "$status" == 200 ]]; then
+            release_id="$(jq -er .id existing-release.json)"
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+              | jq 'add' > existing-assets.json
+            tag_sha="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG^{}" | awk 'NR == 1 { print $1 }')"
+            if [[ -z "$tag_sha" ]]; then
+              tag_sha="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" | awk 'NR == 1 { print $1 }')"
+            fi
+            [[ "$tag_sha" == "$GITHUB_SHA" ]] || {
+              echo "existing release tag resolves to $tag_sha, expected $GITHUB_SHA" >&2
+              exit 1
+            }
+            node --experimental-strip-types scripts/release-evidence.ts compare-release \
+              --release existing-release.json \
+              --assets existing-assets.json \
+              --output assembled/release-upload \
+              --tag "$TAG" \
+              --title "$TITLE" \
+              --body-file release-body.md \
+              --target-sha "$GITHUB_SHA"
+            echo "mode=noop" >> "$GITHUB_OUTPUT"
+          elif [[ "$status" == 404 ]]; then
+            echo "mode=create" >> "$GITHUB_OUTPUT"
+          else
+            echo "GitHub release lookup failed with HTTP $status" >&2
+            jq . existing-release.json >&2 || true
+            exit 1
+          fi
+      - name: Attest all native packages in one statement
+        if: steps.preflight.outputs.mode == 'create'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-checksums: assembled/release-metadata/package-subjects.sha256
+      - name: Create the immutable package release
+        if: steps.preflight.outputs.mode == 'create'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: packaging-v${{ needs.plan.outputs.mesh_version }}
+          TITLE: mesh-llm ${{ needs.plan.outputs.mesh_version }} packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t assets < <(find assembled/release-upload -maxdepth 1 -type f -print0 | sort -z)
+          expected_assets="$(jq -er '(.include | length * 4) + 3' assembled/package-matrix.json)"
+          (( ${#assets[@]} == expected_assets )) || {
+            echo "expected $expected_assets immutable release assets, found ${#assets[@]}" >&2
+            exit 1
+          }
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file release-body.md
+      - name: Verify published release exactly
+        if: steps.preflight.outputs.mode == 'create'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: packaging-v${{ needs.plan.outputs.mesh_version }}
+          TITLE: mesh-llm ${{ needs.plan.outputs.mesh_version }} packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > published-release.json
+          release_id="$(jq -er .id published-release.json)"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+            | jq 'add' > published-assets.json
+          tag_sha="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG^{}" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$tag_sha" ]]; then
+            tag_sha="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" | awk 'NR == 1 { print $1 }')"
+          fi
+          [[ "$tag_sha" == "$GITHUB_SHA" ]] || {
+            echo "published release tag resolves to $tag_sha, expected $GITHUB_SHA" >&2
+            exit 1
+          }
+          node --experimental-strip-types scripts/release-evidence.ts compare-release \
+            --release published-release.json \
+            --assets published-assets.json \
+            --output assembled/release-upload \
+            --tag "$TAG" \
+            --title "$TITLE" \
+            --body-file release-body.md \
+            --target-sha "$GITHUB_SHA"
+
+  readiness:
+    name: Packaging readiness manifest
+    if: always()
+    needs: [plan, upstream, package-image, homebrew, release-assembly, node-sdk-addon, node-sdk-package, node-sdk-preflight, publish-node-sdk, image-index, promote-images, publish-release-assets]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record and enforce required results
+        id: record
+        continue-on-error: true
+        env:
+          PLAN: ${{ needs.plan.result }}
+          UPSTREAM: ${{ needs.upstream.result }}
+          NATIVE_ENABLED: ${{ needs.plan.outputs.native_enabled }}
+          PACKAGE_IMAGES: ${{ needs.package-image.result }}
+          HOMEBREW_ENABLED: ${{ needs.plan.outputs.homebrew_enabled }}
+          HOMEBREW: ${{ needs.homebrew.result }}
+          ASSEMBLY_ENABLED: ${{ needs.plan.outputs.release_assembly_enabled }}
+          RELEASE_ASSEMBLY: ${{ needs.release-assembly.result }}
+          NPM_ENABLED: ${{ needs.plan.outputs.npm_enabled }}
+          NPM_ADDONS: ${{ needs.node-sdk-addon.result }}
+          NPM_PACKAGE: ${{ needs.node-sdk-package.result }}
+          NPM_PREFLIGHT: ${{ needs.node-sdk-preflight.result }}
+          PUBLISH_NPM_REQUESTED: ${{ needs.plan.outputs.publish_npm }}
+          PUBLISH_NPM: ${{ needs.publish-node-sdk.result }}
+          IMAGE_INDEX: ${{ needs.image-index.result }}
+          PROMOTE_IMAGES: ${{ needs.promote-images.result }}
+          PUBLISH_ASSETS: ${{ needs.publish-release-assets.result }}
+          PUBLISH_IMAGES_REQUESTED: ${{ needs.plan.outputs.publish_images }}
+          PUBLISH_ASSETS_REQUESTED: ${{ needs.plan.outputs.publish_release_assets }}
+          CORRELATION_ID: ${{ needs.plan.outputs.correlation_id }}
+          MESH_REPOSITORY: ${{ needs.plan.outputs.mesh_repository }}
+          MESH_REF: ${{ needs.plan.outputs.mesh_ref }}
+          MESH_SHA: ${{ needs.plan.outputs.mesh_sha }}
+          MANIFEST_SHA256: ${{ needs.plan.outputs.manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=success
+          check_required() {
+            [[ "$PLAN" == success ]] || return 1
+            if [[ "$NATIVE_ENABLED" == true ]]; then
+              [[ "$UPSTREAM" == success && "$PACKAGE_IMAGES" == success ]] || return 1
+            fi
+            if [[ "$HOMEBREW_ENABLED" == true ]]; then [[ "$HOMEBREW" == success ]] || return 1; fi
+            if [[ "$ASSEMBLY_ENABLED" == true ]]; then [[ "$RELEASE_ASSEMBLY" == success ]] || return 1; fi
+            if [[ "$NPM_ENABLED" == true ]]; then
+              [[ "$NPM_ADDONS" == success && "$NPM_PACKAGE" == success && "$NPM_PREFLIGHT" == success ]] || return 1
+            fi
+            if [[ "$PUBLISH_NPM_REQUESTED" == true ]]; then [[ "$PUBLISH_NPM" == success ]] || return 1; fi
+            if [[ "$PUBLISH_IMAGES_REQUESTED" == true ]]; then
+              [[ "$IMAGE_INDEX" == success && "$PROMOTE_IMAGES" == success ]] || return 1
+            fi
+            if [[ "$PUBLISH_ASSETS_REQUESTED" == true ]]; then [[ "$PUBLISH_ASSETS" == success ]] || return 1; fi
+          }
+          check_required || status=failure
+          jq -n \
+            --arg status "$status" --arg correlation_id "$CORRELATION_ID" \
+            --arg repository "$MESH_REPOSITORY" --arg ref "$MESH_REF" \
+            --arg sha "$MESH_SHA" --arg manifest_sha256 "$MANIFEST_SHA256" \
+            --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg plan "$PLAN" --arg upstream "$UPSTREAM" --arg package_images "$PACKAGE_IMAGES" \
+            --arg homebrew "$HOMEBREW" --arg release_assembly "$RELEASE_ASSEMBLY" \
+            --arg npm_addons "$NPM_ADDONS" --arg npm_package "$NPM_PACKAGE" --arg npm_preflight "$NPM_PREFLIGHT" --arg publish_npm "$PUBLISH_NPM" \
+            --arg image_index "$IMAGE_INDEX" --arg promote_images "$PROMOTE_IMAGES" --arg publish_assets "$PUBLISH_ASSETS" \
+            --arg publish_images_requested "$PUBLISH_IMAGES_REQUESTED" \
+            --arg publish_assets_requested "$PUBLISH_ASSETS_REQUESTED" \
+            --arg publish_npm_requested "$PUBLISH_NPM_REQUESTED" \
+            '{schema:"mesh-packaging-readiness-v1",status:$status,correlation_id:$correlation_id,packaging_run_id:$run_id,packaging_run_attempt:$run_attempt,upstream:{repository:$repository,ref:$ref,sha:$sha,manifest_sha256:$manifest_sha256},requested:{publish_images:$publish_images_requested,publish_release_assets:$publish_assets_requested,publish_npm:$publish_npm_requested},results:{plan:$plan,upstream:$upstream,package_images:$package_images,homebrew:$homebrew,release_assembly:$release_assembly,npm_addons:$npm_addons,npm_package:$npm_package,npm_preflight:$npm_preflight,publish_npm:$publish_npm,image_index:$image_index,promote_images:$promote_images,publish_release_assets:$publish_assets}}' \
+            | tee packaging-readiness.json
+          [[ "$status" == success ]]
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: packaging-readiness
+          path: packaging-readiness.json
+          if-no-files-found: error
+      - name: Enforce packaging readiness
+        if: ${{ steps.record.outcome != 'success' }}
+        run: exit 1

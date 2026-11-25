@@ -1,0 +1,99 @@
+# Native packages
+
+The package pipeline is deliberately composition-only:
+
+```text
+verified upstream host + runtime bundle -> native package -> install QA -> OCI image
+```
+
+`scripts/upstream-archive.ts` requires a matching one-line SHA256 sidecar,
+enforces `schemas/product-v2.schema.json` semantics and a strict archive
+allowlist, verifies the host/runtime digests, extracts the complete product
+bundle, and records both immutable inputs in provenance.
+The host-required and runtime-supplied Skippy ABI must agree. The native
+manifest uses schema version 2 and an independent runtime `release_version`;
+that version need not equal the MeshLLM product version. Runtime license files
+must be declared with matching digests, and a declared Linux glibc floor must
+be a valid major/minor version.
+The producer repository carries an identical product-v2 schema. The release
+plan downloads that schema at the immutable upstream source SHA and byte-checks
+it against this checkout before any archive, package, or image job starts.
+Contract changes update both copies in the same cross-repository change; a
+release must not proceed with unexplained schema drift.
+`packaging/native/build-package.sh` stages that verified bundle and produces
+exactly one package with version, distro, architecture, backend, and backend
+version in its filename.
+When the producer supplies `plugins/`, the package preserves its unchanged
+release archives beside `native-runtimes/` under
+`/usr/local/lib/mesh-llm/<version>/`. The producer checks each archive against
+the host's compiled pin; the verified outer archive checksum binds those bytes
+during downstream packaging. There is no separate plugin manifest.
+
+Active Debian and Arch builds require `SOURCE_DATE_EPOCH`, the timestamp of the
+immutable upstream commit resolved by the release plan. The workflow passes it
+as a Docker build argument. The builder exports it to the package tools and
+normalizes archive timestamps, owner IDs, and ordering. Identical verified
+bundle bytes and the same package tooling must produce identical packages even
+when extraction times differ. The disabled APK helper retains its existing
+behavior until its upstream musl contract is available.
+
+Supported emitted formats are `.deb` for Ubuntu and `.pkg.tar.zst` for Arch. APK construction exists as a future format helper but no Alpine row is emitted until upstream provides musl binaries.
+
+All variants use the package identity `mesh-llm`; backend/distro details belong in the immutable filename and description. This makes switching variants a package upgrade instead of allowing conflicting packages to own the same binary path.
+
+Native metadata declares the user-space loader dependencies needed by the selected backend. Ubuntu ROCm depends on hipBLAS, which pulls its ROCm BLAS/runtime closure, so the AMD vendor repository is a prerequisite for installing it outside the configured vendor base. Host driver libraries and devices are intentionally not package dependencies.
+
+CUDA declares no user-space toolkit dependency on any distro. Upstream packages cudart, cuBLAS, cuBLASLt, and nvJitLink into the native runtime tree and verifies that closure resolves with `LD_LIBRARY_PATH` unset, so requiring `cuda-cudart`, `libcublas`, `libnccl2`, or Arch's `cuda` would force an NVIDIA repository on users for libraries the package already installs. The NVIDIA driver stays host-owned.
+
+Because CUDA images no longer need a vendor base, they build on the plain distro runtime base. `NVIDIA_VISIBLE_DEVICES` and `NVIDIA_DRIVER_CAPABILITIES` came from the `nvidia/cuda` base before that change, and the container toolkit reads them to inject the host driver, so the matrix now derives them per row and the runtime stage sets them explicitly. Non-NVIDIA rows leave both empty, which the toolkit reads the same as unset.
+
+`scripts/native-package-qa.sh` verifies the exact filename and single-package
+invariant, writes SHA256 manifests, inspects native metadata, installs through
+the distro package manager, proves ownership of the host plus the versioned
+runtime directory, and runs `mesh-llm --version` plus `mesh-llm runtime list`
+without a GPU device or driver. It then uses the shared readiness helper with
+unique API/console ports and cache/runtime roots to start
+both direct client mode and `--log-format json --auto --no-console client`,
+with a loopback discovery relay and iroh relays disabled for automatic
+selection. Both runs require either the JSON
+`Client ready` message or the structured
+`passive_mode`/`status=ready`/`role=client` event while the process is alive,
+and require bounded SIGINT shutdown.
+
+The per-row workflow builds the Dockerfile's final `runtime` target once, then
+runs external QA against that exact image. It verifies package ownership,
+rejects backend imports or unresolved libraries from the host executable, and
+runs the automatic-selection readiness smoke without device access.
+Publishing QA pulls the run-scoped staging image by digest; promotion retags
+that tested digest without rebuilding. Backend libraries may reference their
+driver interface only from inside the native runtime. Hardware-qualified
+serving is separate additive coverage.
+
+The Dockerfile keeps package tooling in `native-package-deps` and runtime
+dependencies in `runtime-deps`. Release versions, source digests, and package
+bytes enter later stages so they cannot invalidate dependency installation.
+The runtime dependency stage installs the complete dependency closure declared
+by the native package, then the final stage installs with dependency checking
+and no second repository refresh. Standalone package installation still
+refreshes repositories and resolves dependencies normally.
+
+Runtime builds also require `PACKAGE_FILE`, the exact matrix package filename.
+A read-only BuildKit bind mount supplies that one file during installation.
+The package archive and its SBOM/provenance sidecars never become image layers;
+changing only a sidecar does not invalidate installation.
+
+Run the bounded local Docker checks with
+`MESH_PACKAGING_DOCKER_TESTS=1 node --experimental-strip-types --test tests/package-build-efficiency.test.ts`.
+Packaging Precheck also runs this Docker fixture suite on pull requests and main.
+They rebuild both active package formats with independent package-build steps
+and different fixture extraction timestamps, compare SHA-256 values, install
+the packages in their distro runtime images, inspect every image layer for
+retained package archives, and verify that changed sidecars retain the install
+cache hit. These use synthetic package contents and do not replace the
+release workflow's real MeshLLM readiness and exact-digest QA.
+
+Packages install the host at `/usr/local/bin/mesh-llm` and the selected runtime
+at `/usr/local/lib/mesh-llm/<version>/native-runtimes/<runtime-id>`, alongside
+the product manifest and host import report.
+
+Native package repositories are not a current release channel. GitHub Release assets may be published with checksums and SBOMs; apt/apk/pacman repositories remain blocked until the signing requirements in `package-signing.md` are implemented.

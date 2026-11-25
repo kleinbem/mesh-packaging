@@ -1,0 +1,6 @@
+artifacts/
+.sisyphus/
+__pycache__/
+*.py[cod]
+
+.omo

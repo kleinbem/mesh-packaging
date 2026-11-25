@@ -1,0 +1,121 @@
+class MeshLlm < Formula
+  desc "Local mesh-llm CLI runtime"
+  homepage "https://github.com/Mesh-LLM/mesh-llm"
+  url "https://github.com/Mesh-LLM/mesh-llm/releases/download/v{{VERSION}}/{{ASSET}}"
+  sha256 "{{MACOS_ARM64_SHA256}}"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  depends_on arch: :arm64
+
+  def install
+    bin.install "mesh-llm"
+    libexec.install "product-manifest.json"
+    libexec.install "host-imports.json"
+    # Keep the unchanged release archives where the host finds its pinned defaults.
+    # These gzip archives are unaffected by Mach-O keg relocation.
+    libexec.install "plugins" if File.directory?("plugins")
+
+    # The native runtime manifest records a SHA-256 for every runtime file and
+    # the loader refuses a runtime whose files have changed. Keg relocation
+    # rewrites install names and re-signs every Mach-O file, which invalidates
+    # all of them, so stage the runtime as an archive here and unpack it in
+    # `post_install_steps`, once relocation has run. The runtime needs no
+    # relocation: its libraries link only against system libraries and resolve
+    # each other through @loader_path.
+    system "tar", "czf", libexec/"native-runtime.tar.gz", "native-runtimes"
+  end
+
+  post_install_steps do
+    run "/usr/bin/tar",
+        args:           ["xzf", "{{libexec}}/native-runtime.tar.gz", "-C", "{{libexec}}"],
+        writable_paths: ["{{libexec}}"]
+  end
+
+  def terminate_test_process(pid)
+    stopped = %w[TERM KILL].any? do |signal|
+      Process.kill(signal, pid)
+      Timeout.timeout(5) { Process.wait(pid) }
+      true
+    rescue Errno::ESRCH, Errno::ECHILD
+      true
+    rescue Timeout::Error
+      false
+    end
+    flunk "mesh-llm client forced cleanup did not finish" unless stopped
+  end
+
+  test do
+    require "digest"
+    require "json"
+    require "timeout"
+
+    assert_path_exists libexec/"product-manifest.json"
+    manifest = JSON.parse((libexec/"product-manifest.json").read)
+    assert_equal manifest.fetch("host").fetch("sha256"), Digest::SHA256.file(bin/"mesh-llm").hexdigest
+    assert_match version.to_s, shell_output("#{bin}/mesh-llm --version")
+
+    # `runtime list` prints a warning naming any runtime it rejected and still
+    # exits 0, so assert that the runtime was actually discovered rather than
+    # matching text that a rejection also prints.
+    runtimes = shell_output("#{bin}/mesh-llm runtime list")
+    assert_match "meshllm-native-runtime-darwin-aarch64-metal", runtimes
+    refute_match "malformed native runtime", runtimes
+    refute_match "No local native runtimes found", runtimes
+
+    smoke_root = testpath/"client-readiness"
+    log = smoke_root/"client.jsonl"
+    runtime_root = smoke_root/"runtime"
+    port = free_port
+    console = free_port
+    console = free_port while console == port
+    pid = fork do
+      ENV["HOME"] = (smoke_root/"home").to_s
+      ENV["XDG_CACHE_HOME"] = (smoke_root/"cache").to_s
+      ENV["XDG_CONFIG_HOME"] = (smoke_root/"config").to_s
+      ENV["XDG_RUNTIME_DIR"] = runtime_root.to_s
+      ENV["MESH_LLM_RUNTIME_ROOT"] = runtime_root.to_s
+      ENV["MESH_LLM_NATIVE_RUNTIME_CACHE_DIR"] = (smoke_root/"native-runtime-cache").to_s
+      [smoke_root/"home", smoke_root/"cache", smoke_root/"config", runtime_root,
+       smoke_root/"native-runtime-cache"].each(&:mkpath)
+      log.open("w") do |file|
+        $stdout.reopen(file)
+        $stderr.reopen(file)
+        exec bin/"mesh-llm", "--log-format", "json", "--auto", "--disable-iroh-relays",
+             "--nostr-relay", "ws://127.0.0.1:1/", "--port", port.to_s,
+             "--console", console.to_s, "--no-console", "client"
+      end
+    end
+
+    ready = false
+    90.times do
+      ready = log.exist? && log.each_line.any? do |line|
+        event = JSON.parse(line)
+        event["message"].to_s.include?("Client ready") ||
+          (event["event"] == "passive_mode" && event["status"] == "ready" && event["role"] == "client")
+      rescue JSON::ParserError
+        false
+      end
+      break if ready && Process.kill(0, pid)
+
+      sleep 1
+    rescue Errno::ESRCH
+      break
+    end
+
+    begin
+      flunk "mesh-llm client did not reach Client ready: #{log.exist? ? log.read : "no log"}" unless ready
+      assert Process.kill(0, pid), "mesh-llm client exited after readiness"
+    ensure
+      begin
+        Process.kill("INT", pid) if Process.kill(0, pid)
+        _, status = Timeout.timeout(30) { Process.wait2(pid) }
+        assert_predicate status, :success?, "mesh-llm client did not shut down cleanly"
+      rescue Errno::ESRCH, Errno::ECHILD
+        flunk "mesh-llm client exited before bounded SIGINT shutdown"
+      rescue Timeout::Error
+        terminate_test_process(pid)
+        flunk "mesh-llm client did not stop within 30 seconds of SIGINT"
+      end
+    end
+  end
+end

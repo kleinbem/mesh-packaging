@@ -1,0 +1,93 @@
+# Release checklist
+
+## Upstream contract
+
+- [ ] The upstream tag and non-draft GitHub Release exist and the tag resolves to one immutable SHA.
+- [ ] Every generated archive and `.sha256` sidecar exists in that release.
+- [ ] All four supported Node addon archives and sidecars exist; safe extraction verifies
+  their exact target path, manifest identity, and inner addon digest.
+- [ ] Archive verification accepts only the product-v2 host, host-import report,
+  product manifest, exactly one runtime tree, and optional bundled plugin
+  archives. Packaging preserves the producer-validated plugin bytes and checks
+  that `plugins/*.tar.gz` entries are nonempty regular files in a flat directory;
+  the verified outer archive checksum binds those bytes. Before creating the
+  product archive, the producer requires the bundled host to verify its plugin
+  pins, decode and install every archive, and validate each plugin's layout.
+  Packaging checks every recorded digest and rejects unexpected or
+  traversal-prone outer entries.
+- [ ] The full matrix matches the current release asset inventory. Unsupported channels remain disabled rather than inferred.
+
+## Dry-run QA
+
+- [ ] A full `dry_run=true` workflow succeeds with publish jobs skipped.
+- [ ] The unfiltered dry run assembles exactly 11 package rows and 47 release
+  assets. `SHA256SUMS` exactly covers every non-manifest asset, and the single
+  aggregate `provenance.json` contains 11 unique package name/SHA-256 subjects.
+- [ ] Every native package passes metadata inspection, exact filename/checksum
+  checks, package-manager installation, `mesh-llm --version`, `--help`, and
+  `mesh-llm runtime list` without GPU passthrough. The package owns the
+  versioned runtime tree, and an empty user cache stays empty. The exact
+  package-owned executable then reaches structured JSON client readiness while
+  alive and stops cleanly on SIGINT within the bounded timeout.
+- [ ] Every runtime image installs the matching package artifact. Every backend,
+  including CUDA, passes the no-device command smoke and the neutral host has no
+  backend runtime imports. The final entrypoint reaches structured JSON client
+  readiness while the container remains alive, stops cleanly within the bounded
+  timeout, and leaves no test container or listener behind.
+- [ ] The arm64 Homebrew formula installs and tests the upstream Metal archive.
+  The installed Cellar binary matches its product-manifest digest before
+  execution, reaches structured JSON client readiness while alive, and completes
+  bounded clean shutdown with isolated runtime and cache state.
+- [ ] Every enabled npm addon lane succeeds; one assembled tarball passes
+  `npm publish --dry-run`. Every selected target installs that same tarball in
+  a clean project on its native runner, verifies the runner target, and completes public
+  `Node.fromConfig`, `start`, `status`, and `finally`-guarded `stop` with normal
+  process exit and verified temporary-state cleanup.
+- [ ] The final readiness manifest reports success for plan, upstream, native
+  packages, runtime images, Homebrew, npm assembly, and every enabled npm
+  addon/preflight lane. A failed, cancelled, or skipped required preflight
+  prevents npm publication and readiness success.
+
+## Publication
+
+- [ ] For a stable upstream release with the complete GPU matrix, the upstream
+  packaging verification job succeeds. It waits for the matching terminal
+  packaging run and attempt, verifies the
+  receipt's exact upstream tag commit, native manifest digest, supplied
+  `mesh-<upstream-run>-<attempt>` correlation ID, and every requested channel
+  result. A failed or missing receipt fails the job. For manual backfills and
+  historical legacy dispatches, the operator verifies the receipt directly.
+  Legacy dispatches use `legacy-<run>-<attempt>`.
+- [ ] A reviewer confirms the selected publish switches and the `release` environment gate.
+- [ ] GHCR tags match `docs/tagging.md`; pushed digests receive provenance attestations.
+- [ ] The canonical image index binds every selected row to its digest-qualified
+  base, package/product hashes, and exact QA-tested staging digest.
+- [ ] Image promotion performs no Docker build, rejects version-tag drift, and
+  preserves previous moving-tag digests in the rollback ledger.
+- [ ] Package release assets contain exact packages, SHA256 manifests, SPDX SBOMs, and the rendered formula.
+- [ ] Every package SPDX document names the exact `.deb` or `.pkg.tar.zst`
+  basename and its verified sidecar SHA-256. Every uniquely named per-row
+  BuildKit statement names the same subject before aggregate assembly.
+- [ ] Every publish channel uses its complete exact selector (`all`).
+- [ ] A new `packaging-v<version>` release does not already exist. If it does,
+  the workflow may no-op only when tag target, title, body, state, exact asset
+  names, and GitHub asset digests all match; otherwise publication must fail.
+- [ ] Release upload does not use `--clobber`, and the post-create API check
+  proves the published asset set is byte-for-byte identical to the assembly.
+- [ ] If `publish_npm=true`, npm provenance names `mesh-packaging` and the
+  version has the expected `latest` or `next` dist-tag.
+- [ ] No native runtime bundles or manifest are republished here.
+- [ ] The release record names the upstream tag and immutable SHA.
+- [ ] After stable package publication, the Homebrew tap successfully audits,
+  installs, and tests the changed formula, then commits the expected formula
+  bytes from that packaging release. An unchanged successful scheduled sync
+  does not establish installation or runtime readiness.
+
+## External automation
+
+- [ ] Upstream has a fine-grained `MESH_AGENT_IMAGES_DISPATCH_TOKEN` or GitHub App installation with Contents write and Actions read access scoped to this repository.
+- [ ] Upstream sends `mesh-llm-release` only after its complete non-canary release is published, with each intended publication switch enabled.
+- [ ] The dispatch explicitly sets `publish_npm`; omitted values do not publish.
+- [ ] The first automated dispatch is observed end-to-end before enabling publication by dispatch payload.
+- [ ] The existing `ghcr.io/mesh-llm/mesh-llm` package grants Actions write access to `Mesh-LLM/mesh-packaging`.
+- [ ] The GHCR package visibility is intentionally selected; public visibility cannot be reverted to private.
